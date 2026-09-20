@@ -59,6 +59,7 @@ jobs:
           import json
           import random
           import threading
+          import queue
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from collections import OrderedDict
           # ebooklib 和 html 不再需要
@@ -79,12 +80,15 @@ jobs:
           CONFIG = {
               "max_workers": threads_count,
               "max_retries": 2,  # 每个接口对单个章节的重试次数
+              "chapter_rounds": 3,  # 单个章节最多把所有可用接口轮询几遍
               "request_timeout": 15,
               "probe_timeout": 10,  # 启动探测时单个请求的超时
               "probe_chapters": 3,  # 启动探测使用的章节数
               "min_probe_chars": 300,  # 探测章节的最长正文低于此值，视为只返回预览、不可用
-              "max_consecutive_failures": 10,  # 连续这么多章失败(所有接口都试过)就中止
-              "source_dead_after": 3,  # 单个接口连续失败这么多次后本次运行不再使用
+              "source_fail_threshold": 3,  # 单个接口连续失败这么多次后暂停使用
+              "source_cooldown": 30,  # 暂停秒数，之后再次失败则翻倍
+              "source_cooldown_max": 300,
+              "max_stall_seconds": 180,  # 这么久没有成功下载任何一章就判定接口已失效并中止
               "min_success_ratio": 0.9,  # 成功章节占比低于此值视为失败
               "min_avg_chars": 300,  # 成功章节平均字数低于此值视为内容被截断
               "status_file": "chapter.json",
@@ -99,6 +103,7 @@ jobs:
           # 都是第三方接口，随时可能失效；启动时会逐个探测，只使用当前可用的。
           # 官方网页版只返回约150字预览，无法用来下载全文。
           CONTENT_SOURCES = [
+              "https://fq-book.netsite.cc/content?item_id={id}",  # 会302跳转到 fq-book.nat.netsite.cc，requests会自动跟随
               "https://api.cenguigui.cn/api/tomato/content.php?item_id={id}",
               "http://101.35.133.34:5000/api/content?tab=%E5%B0%8F%E8%AF%B4&item_id={id}",
               "http://101.35.133.34:5000/api/chapter?item_id={id}",
@@ -163,7 +168,10 @@ jobs:
                   content = content[len(title):].lstrip()
 
               content = re.sub(r'\n{2,}', '\n', content).strip()
-              return '\n'.join(['    ' + line if line.strip() else line for line in content.split('\n')])
+              return '\n'.join(['    ' + line.strip() if line.strip() else '' for line in content.split('\n')])
+
+          # 说明"这一章在该接口上没有内容"而不是"接口坏了"的错误：不计入接口健康度，也不必重试
+          CHAPTER_ERRORS = ("正文为空", "HTTP 404")
 
           def fetch_content(source, item_id, timeout):
               """从单个接口获取章节正文，返回 (正文, 错误说明)，失败时正文为 None"""
@@ -181,8 +189,10 @@ jobs:
               if not isinstance(data, dict):
                   return None, "响应格式异常"
 
-              # 不同接口的返回结构略有差异：正文在 data.content 或顶层 content
-              body = data.get("data") if isinstance(data.get("data"), dict) else data
+              # 不同接口的返回结构略有差异：正文在顶层、data.content 或 data.data.content
+              body = data
+              while "content" not in body and isinstance(body.get("data"), dict):
+                  body = body["data"]
               content = body.get("content")
               if not isinstance(content, str) or not content.strip():
                   return None, "正文为空"
@@ -192,42 +202,68 @@ jobs:
               return content, None
 
           class SourceHealth:
-              """记录各接口的连续失败次数，连续失败过多的接口在本次运行中停用"""
+              """记录各接口的连续失败次数。连续失败的接口先暂停一段时间(冷却)再重试，
+              而不是永久停用——第三方接口经常只是短暂卡顿。"""
               def __init__(self, sources):
                   self.lock = threading.Lock()
                   self.sources = list(sources)
                   self.fails = {s: 0 for s in self.sources}
-                  self.dead = set()
+                  self.cooldown = {s: 0 for s in self.sources}  # 当前冷却时长
+                  self.resume_at = {s: 0.0 for s in self.sources}
 
               def alive(self):
+                  now = time.time()
                   with self.lock:
-                      return [s for s in self.sources if s not in self.dead]
+                      return [s for s in self.sources if self.resume_at[s] <= now]
 
               def ok(self, source):
                   with self.lock:
                       self.fails[source] = 0
+                      self.cooldown[source] = 0
 
               def fail(self, source):
                   with self.lock:
                       self.fails[source] += 1
-                      if self.fails[source] >= CONFIG["source_dead_after"] and source not in self.dead:
-                          self.dead.add(source)
-                          print(f"接口已停用(连续失败{self.fails[source]}次): {source}")
+                      if self.fails[source] >= CONFIG["source_fail_threshold"]:
+                          self.fails[source] = 0
+                          self.cooldown[source] = min(
+                              self.cooldown[source] * 2 or CONFIG["source_cooldown"],
+                              CONFIG["source_cooldown_max"])
+                          self.resume_at[source] = time.time() + self.cooldown[source]
+                          print(f"接口连续失败，暂停 {self.cooldown[source]} 秒后重试: {source}")
 
           def down_text(it, health):
-              """下载章节内容：依次尝试可用接口，全部失败返回空字符串"""
-              for source in health.alive():
-                  for attempt in range(CONFIG["max_retries"]):
+              """下载章节内容：依次尝试可用接口；接口都在冷却时等待，最多轮询几遍。
+              返回 (正文, 失败原因)，失败时正文为空字符串"""
+              last_err = "无可用接口"
+              for _ in range(CONFIG["chapter_rounds"]):
+                  sources = health.alive()
+                  while not sources:
                       if abort.is_set():
-                          return ""
-                      content, _ = fetch_content(source, it, CONFIG["request_timeout"])
-                      if content:
-                          health.ok(source)
-                          return content
-                      if attempt + 1 < CONFIG["max_retries"]:
-                          time.sleep(1)
-                  health.fail(source)
-              return ""
+                          return "", "已中止"
+                      time.sleep(1)
+                      sources = health.alive()
+
+                  source_trouble = False  # 本轮是否有接口出现了"接口本身的问题"(超时/5xx等)，值得稍后再试
+                  for source in sources:
+                      for attempt in range(CONFIG["max_retries"]):
+                          if abort.is_set():
+                              return "", "已中止"
+                          content, err = fetch_content(source, it, CONFIG["request_timeout"])
+                          if content:
+                              health.ok(source)
+                              return content, None
+                          last_err = err
+                          if err in CHAPTER_ERRORS:
+                              break  # 这个接口没有这一章，重试没有意义，换下一个接口
+                          if attempt + 1 < CONFIG["max_retries"]:
+                              time.sleep(1)
+                      if last_err not in CHAPTER_ERRORS:
+                          source_trouble = True
+                          health.fail(source)
+                  if not source_trouble:
+                      break  # 所有接口都明确表示没有这一章，再轮询也一样
+              return "", last_err
 
           def probe_sources(chapters):
               """用前几章并发探测所有接口，返回可用接口列表(保持优先级顺序)。
@@ -357,52 +393,65 @@ jobs:
 
                   # 下载章节
                   total_chapters = len(chapters)
-                  success_count = 0
-                  consecutive_failures = 0
-                  abort_reason = None
-                  failed_titles = []
                   content_cache = OrderedDict()
 
-                  # 多线程下载所有章节；连续失败过多或所有接口都失效时立即中止
-                  executor = ThreadPoolExecutor(max_workers=CONFIG["max_workers"])
-                  try:
-                      future_to_chapter = {
-                          executor.submit(down_text, chapter["id"], health): chapter
-                          for chapter in chapters
-                      }
+                  def run_batch(batch):
+                      """多线程下载一批章节，返回中止原因（正常结束为 None）。
+                      完成的任务通过队列回到主线程，主线程同时充当看门狗：
+                      太久没有任何章节成功，说明接口已经失效，立即中止而不是无限等待"""
+                      done_queue = queue.Queue()
+                      last_success = time.time()
+                      executor = ThreadPoolExecutor(max_workers=CONFIG["max_workers"])
+                      try:
+                          for chapter in batch:
+                              future = executor.submit(down_text, chapter["id"], health)
+                              future.add_done_callback(lambda f, ch=chapter: done_queue.put((ch, f)))
 
-                      for future in as_completed(future_to_chapter):
-                          chapter = future_to_chapter[future]
-                          try:
-                              content = future.result()
-                          except Exception as e:
-                              print(f"下载出错：{chapter['title']} - {str(e)}")
-                              content = ""
+                          completed = 0
+                          while completed < len(batch):
+                              try:
+                                  chapter, future = done_queue.get(timeout=5)
+                              except queue.Empty:
+                                  chapter = None
 
-                          if content:
-                              content_cache[chapter["index"]] = (chapter, content)
-                              success_count += 1
-                              consecutive_failures = 0
-                              print(f"已下载：{chapter['title']}")
-                          else:
-                              failed_titles.append(chapter["title"])
-                              consecutive_failures += 1
-                              print(f"下载失败：{chapter['title']}")
+                              if chapter is not None:
+                                  completed += 1
+                                  try:
+                                      content, err = future.result()
+                                  except Exception as e:
+                                      content, err = "", str(e)
 
-                          progress = (success_count / total_chapters) * 100
-                          print(f"进度: {progress:.2f}% - 正在下载: {success_count}/{total_chapters}")
+                                  if content:
+                                      content_cache[chapter["index"]] = (chapter, content)
+                                      last_success = time.time()
+                                      print(f"已下载：{chapter['title']}")
+                                  else:
+                                      print(f"下载失败：{chapter['title']}（{err}）")
+                                  progress = (len(content_cache) / total_chapters) * 100
+                                  print(f"进度: {progress:.2f}% - 正在下载: {len(content_cache)}/{total_chapters}")
 
-                          if not health.alive():
-                              abort_reason = "所有内容接口均已失效"
-                          elif consecutive_failures >= CONFIG["max_consecutive_failures"]:
-                              abort_reason = f"连续 {consecutive_failures} 章下载失败"
-                          if abort_reason:
-                              abort.set()
-                              executor.shutdown(wait=False, cancel_futures=True)
-                              break
-                  finally:
-                      executor.shutdown(wait=True)
+                              stalled = time.time() - last_success
+                              if stalled > CONFIG["max_stall_seconds"]:
+                                  abort.set()
+                                  executor.shutdown(wait=False, cancel_futures=True)
+                                  return f"已 {stalled:.0f} 秒没有成功下载任何章节，内容接口可能已失效"
+                          return None
+                      finally:
+                          executor.shutdown(wait=True)
 
+                  abort_reason = run_batch(chapters)
+
+                  # 接口短暂卡顿时会丢掉少量章节：接口恢复后再补下一遍。
+                  # 补下载阶段停滞只说明这些章节本身取不到，不算整体失败，放弃即可
+                  missing = [c for c in chapters if c["index"] not in content_cache]
+                  if missing and not abort_reason:
+                      print(f"\n有 {len(missing)} 章未下载成功，重试一遍...")
+                      retry_stall = run_batch(missing)
+                      if retry_stall:
+                          print(f"补下载中止：{retry_stall}")
+
+                  success_count = len(content_cache)
+                  failed_titles = [c["title"] for c in chapters if c["index"] not in content_cache]
                   if abort_reason:
                       raise Exception(f"{abort_reason}（已成功 {success_count}/{total_chapters} 章），已中止下载")
 
@@ -480,7 +529,8 @@ jobs:
         run: |
           echo "开始下载小说 (TXT格式)..."
           # 不再传递 format 参数
-          python download_novel.py "${{ github.event.inputs.novel_id }}" "${{ github.event.inputs.threads }}"
+          # -u: 不缓冲输出，Actions 日志才能实时显示下载进度
+          python -u download_novel.py "${{ github.event.inputs.novel_id }}" "${{ github.event.inputs.threads }}"
 
       - name: 压缩下载结果
         run: |
