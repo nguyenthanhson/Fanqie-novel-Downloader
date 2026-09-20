@@ -58,6 +58,7 @@ jobs:
           import re
           import json
           import random
+          import threading
           from concurrent.futures import ThreadPoolExecutor, as_completed
           from collections import OrderedDict
           # ebooklib 和 html 不再需要
@@ -77,8 +78,15 @@ jobs:
           # 从GUI.py复制必要的函数和配置
           CONFIG = {
               "max_workers": threads_count,
-              "max_retries": 3,
+              "max_retries": 2,  # 每个接口对单个章节的重试次数
               "request_timeout": 15,
+              "probe_timeout": 10,  # 启动探测时单个请求的超时
+              "probe_chapters": 3,  # 启动探测使用的章节数
+              "min_probe_chars": 300,  # 探测章节的最长正文低于此值，视为只返回预览、不可用
+              "max_consecutive_failures": 10,  # 连续这么多章失败(所有接口都试过)就中止
+              "source_dead_after": 3,  # 单个接口连续失败这么多次后本次运行不再使用
+              "min_success_ratio": 0.9,  # 成功章节占比低于此值视为失败
+              "min_avg_chars": 300,  # 成功章节平均字数低于此值视为内容被截断
               "status_file": "chapter.json",
               "user_agents": [
                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -86,6 +94,22 @@ jobs:
                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
               ]
           }
+
+          # 章节内容接口候选列表，按优先级排列，{id} 会被替换为章节ID。
+          # 都是第三方接口，随时可能失效；启动时会逐个探测，只使用当前可用的。
+          # 官方网页版只返回约150字预览，无法用来下载全文。
+          CONTENT_SOURCES = [
+              "https://api.cenguigui.cn/api/tomato/content.php?item_id={id}",
+              "http://101.35.133.34:5000/api/content?tab=%E5%B0%8F%E8%AF%B4&item_id={id}",
+              "http://101.35.133.34:5000/api/chapter?item_id={id}",
+              "http://101.35.133.34:5000/api/raw_full?item_id={id}",
+              "https://tt.sjmyzq.cn/api/raw_full?item_id={id}",
+              "http://rehaofan.jingluo.love/content?item_id={id}",
+              "https://lsjk.zyii.xyz:3666/content?item_id={id}",
+          ]
+
+          # 中止信号：任一处判定必须中止时置位，正在运行的线程随后尽快退出
+          abort = threading.Event()
 
           def get_headers(cookie=None):
               """生成随机请求头"""
@@ -124,44 +148,115 @@ jobs:
                       time.sleep(0.5)
               raise Exception("无法获取有效Cookie")
 
-          def down_text(it):
-              """下载章节内容"""
-              max_retries = CONFIG.get('max_retries', 3)
-              retry_count = 0
-              content = ""
+          def clean_content(content, title=""):
+              """移除HTML标签并整理排版"""
+              content = re.sub(r'<header>.*?</header>', '', content, flags=re.DOTALL)
+              content = re.sub(r'<footer>.*?</footer>', '', content, flags=re.DOTALL)
+              content = re.sub(r'</?article>', '', content)
+              content = re.sub(r'<p idx="\d+">', '\n', content)
+              content = re.sub(r'</p>', '\n', content)
+              content = re.sub(r'<[^>]+>', '', content)
+              content = re.sub(r'\\u003c|\\u003e', '', content)
 
-              while retry_count < max_retries:
-                  try:
-                      api_url = f"https://api.cenguigui.cn/api/tomato/content.php?item_id={it}"
-                      response = requests.get(api_url, timeout=CONFIG["request_timeout"])
-                      data = response.json()
+              # 处理可能的重复章节标题行
+              if title and content.startswith(title):
+                  content = content[len(title):].lstrip()
 
-                      if data.get("code") == 200:
-                          content = data.get("data", {}).get("content", "")
+              content = re.sub(r'\n{2,}', '\n', content).strip()
+              return '\n'.join(['    ' + line if line.strip() else line for line in content.split('\n')])
 
-                          # 移除HTML标签
-                          content = re.sub(r'<header>.*?</header>', '', content, flags=re.DOTALL)
-                          content = re.sub(r'<footer>.*?</footer>', '', content, flags=re.DOTALL)
-                          content = re.sub(r'</?article>', '', content)
-                          content = re.sub(r'<p idx="\d+">', '\n', content)
-                          content = re.sub(r'</p>', '\n', content)
-                          content = re.sub(r'<[^>]+>', '', content)
-                          content = re.sub(r'\\u003c|\\u003e', '', content)
+          def fetch_content(source, item_id, timeout):
+              """从单个接口获取章节正文，返回 (正文, 错误说明)，失败时正文为 None"""
+              url = source.replace("{id}", item_id)
+              try:
+                  response = requests.get(url, timeout=timeout)
+              except requests.RequestException as e:
+                  return None, type(e).__name__
+              if response.status_code != 200:
+                  return None, f"HTTP {response.status_code}"
+              try:
+                  data = response.json()
+              except ValueError:
+                  return None, "响应不是JSON"
+              if not isinstance(data, dict):
+                  return None, "响应格式异常"
 
-                          # 处理可能的重复章节标题行
-                          title = data.get("data", {}).get("title", "")
-                          if title and content.startswith(title):
-                              content = content[len(title):].lstrip()
+              # 不同接口的返回结构略有差异：正文在 data.content 或顶层 content
+              body = data.get("data") if isinstance(data.get("data"), dict) else data
+              content = body.get("content")
+              if not isinstance(content, str) or not content.strip():
+                  return None, "正文为空"
+              content = clean_content(content, body.get("title", ""))
+              if not content:
+                  return None, "正文为空"
+              return content, None
 
-                          content = re.sub(r'\n{2,}', '\n', content).strip()
-                          content = '\n'.join(['    ' + line if line.strip() else line for line in content.split('\n')])
-                          break
-                  except Exception as e:
-                      print(f"请求失败: {str(e)}, 重试第{retry_count + 1}次...")
-                      retry_count += 1
-                      time.sleep(1 * retry_count)
+          class SourceHealth:
+              """记录各接口的连续失败次数，连续失败过多的接口在本次运行中停用"""
+              def __init__(self, sources):
+                  self.lock = threading.Lock()
+                  self.sources = list(sources)
+                  self.fails = {s: 0 for s in self.sources}
+                  self.dead = set()
 
-              return content
+              def alive(self):
+                  with self.lock:
+                      return [s for s in self.sources if s not in self.dead]
+
+              def ok(self, source):
+                  with self.lock:
+                      self.fails[source] = 0
+
+              def fail(self, source):
+                  with self.lock:
+                      self.fails[source] += 1
+                      if self.fails[source] >= CONFIG["source_dead_after"] and source not in self.dead:
+                          self.dead.add(source)
+                          print(f"接口已停用(连续失败{self.fails[source]}次): {source}")
+
+          def down_text(it, health):
+              """下载章节内容：依次尝试可用接口，全部失败返回空字符串"""
+              for source in health.alive():
+                  for attempt in range(CONFIG["max_retries"]):
+                      if abort.is_set():
+                          return ""
+                      content, _ = fetch_content(source, it, CONFIG["request_timeout"])
+                      if content:
+                          health.ok(source)
+                          return content
+                      if attempt + 1 < CONFIG["max_retries"]:
+                          time.sleep(1)
+                  health.fail(source)
+              return ""
+
+          def probe_sources(chapters):
+              """用前几章并发探测所有接口，返回可用接口列表(保持优先级顺序)。
+              只有返回了足够长正文的接口才算可用，只返回预览片段的接口会被排除。"""
+              sample = chapters[:CONFIG["probe_chapters"]]
+              jobs = [(s, c["id"]) for s in CONTENT_SOURCES for c in sample]
+              longest = {}
+              errors = {}
+              with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+                  futures = {executor.submit(fetch_content, s, cid, CONFIG["probe_timeout"]): s for s, cid in jobs}
+                  for future in as_completed(futures):
+                      source = futures[future]
+                      content, err = future.result()
+                      if content:
+                          longest[source] = max(longest.get(source, 0), len(content))
+                      else:
+                          errors[source] = err
+
+              usable = []
+              print("接口探测结果:")
+              for source in CONTENT_SOURCES:
+                  if longest.get(source, 0) >= CONFIG["min_probe_chars"]:
+                      print(f"  可用  ({longest[source]}字) {source}")
+                      usable.append(source)
+                  elif source in longest:
+                      print(f"  排除  (最长仅{longest[source]}字，疑似只返回预览) {source}")
+                  else:
+                      print(f"  失败  ({errors.get(source, '无响应')}) {source}")
+              return usable
 
           def get_book_info(book_id, headers):
               """获取书名、作者、简介"""
@@ -247,13 +342,15 @@ jobs:
                   if not chapters:
                       raise Exception("未找到任何章节")
 
+                  # 先探测内容接口：全部不可用时几秒内就失败，而不是逐章重试几十分钟
+                  print(f"\n共 {len(chapters)} 章，正在探测内容接口...")
+                  usable_sources = probe_sources(chapters)
+                  if not usable_sources:
+                      raise Exception("没有可用的内容接口（全部无法访问、返回错误或只返回预览），已中止下载")
+                  health = SourceHealth(usable_sources)
+
                   print(f"\n开始下载，共 {len(chapters)} 章")
                   os.makedirs(save_path, exist_ok=True)
-
-                  # 创建文件并写入信息
-                  output_file = os.path.join(save_path, f"{name}.txt")
-                  with open(output_file, 'w', encoding='utf-8') as f:
-                      f.write(f"书名：《{name}》\n作者：{author_name}\n\n简介：\n{description}\n\n")
 
                   # 不再需要 EPUB 相关逻辑
                   # if output_format == 'epub': ...
@@ -261,49 +358,78 @@ jobs:
                   # 下载章节
                   total_chapters = len(chapters)
                   success_count = 0
-                  downloaded_chapters = set()
+                  consecutive_failures = 0
+                  abort_reason = None
+                  failed_titles = []
                   content_cache = OrderedDict()
 
-                  # 先顺序下载前5章
-                  for chapter in chapters[:5]:
-                      content = down_text(chapter["id"])
-                      if content:
-                          content_cache[chapter["index"]] = (chapter, content)
-                          downloaded_chapters.add(chapter["id"])
-                          success_count += 1
-                          progress = (success_count / total_chapters) * 100
-                          print(f"进度: {progress:.2f}% - 正在下载: {success_count}/{total_chapters}")
-                          print(f"已下载：{chapter['title']}")
-
-                  # 多线程下载剩余章节
-                  remaining_chapters = chapters[5:]
-                  with ThreadPoolExecutor(max_workers=CONFIG["max_workers"]) as executor:
+                  # 多线程下载所有章节；连续失败过多或所有接口都失效时立即中止
+                  executor = ThreadPoolExecutor(max_workers=CONFIG["max_workers"])
+                  try:
                       future_to_chapter = {
-                          executor.submit(down_text, chapter["id"]): chapter
-                          for chapter in remaining_chapters
+                          executor.submit(down_text, chapter["id"], health): chapter
+                          for chapter in chapters
                       }
 
                       for future in as_completed(future_to_chapter):
                           chapter = future_to_chapter[future]
                           try:
                               content = future.result()
-                              if content:
-                                  content_cache[chapter["index"]] = (chapter, content)
-                                  downloaded_chapters.add(chapter["id"])
-                                  success_count += 1
-                                  print(f"已下载：{chapter['title']}")
                           except Exception as e:
-                              print(f"下载失败：{chapter['title']} - {str(e)}")
-                          finally:
-                              progress = (success_count / total_chapters) * 100
-                              print(f"进度: {progress:.2f}% - 正在下载: {success_count}/{total_chapters}")
+                              print(f"下载出错：{chapter['title']} - {str(e)}")
+                              content = ""
+
+                          if content:
+                              content_cache[chapter["index"]] = (chapter, content)
+                              success_count += 1
+                              consecutive_failures = 0
+                              print(f"已下载：{chapter['title']}")
+                          else:
+                              failed_titles.append(chapter["title"])
+                              consecutive_failures += 1
+                              print(f"下载失败：{chapter['title']}")
+
+                          progress = (success_count / total_chapters) * 100
+                          print(f"进度: {progress:.2f}% - 正在下载: {success_count}/{total_chapters}")
+
+                          if not health.alive():
+                              abort_reason = "所有内容接口均已失效"
+                          elif consecutive_failures >= CONFIG["max_consecutive_failures"]:
+                              abort_reason = f"连续 {consecutive_failures} 章下载失败"
+                          if abort_reason:
+                              abort.set()
+                              executor.shutdown(wait=False, cancel_futures=True)
+                              break
+                  finally:
+                      executor.shutdown(wait=True)
+
+                  if abort_reason:
+                      raise Exception(f"{abort_reason}（已成功 {success_count}/{total_chapters} 章），已中止下载")
+
+                  # 结果校验：全部失败、失败过多或内容被截断都不算下载成功
+                  print(f"\n下载结束：成功 {success_count} 章，失败 {len(failed_titles)} 章")
+                  if success_count / total_chapters < CONFIG["min_success_ratio"]:
+                      raise Exception(
+                          f"仅成功 {success_count}/{total_chapters} 章，"
+                          f"低于 {CONFIG['min_success_ratio']:.0%} 的下限")
+                  avg_chars = sum(len(c) for _, c in content_cache.values()) / success_count
+                  if avg_chars < CONFIG["min_avg_chars"]:
+                      raise Exception(f"成功章节平均仅 {avg_chars:.0f} 字，内容疑似被截断（只有预览）")
+                  if failed_titles:
+                      print("未能下载的章节：")
+                      for title in failed_titles[:30]:
+                          print(f"- {title}")
+                      if len(failed_titles) > 30:
+                          print(f"... 另有 {len(failed_titles) - 30} 章")
 
                   # 按顺序写入文件
                   print("\n正在保存文件...")
+                  output_file = os.path.join(save_path, f"{name}.txt")
 
                   # 检查重复章节内容
                   processed_contents = set()
-                  with open(output_file, 'a', encoding='utf-8') as f:
+                  with open(output_file, 'w', encoding='utf-8') as f:
+                      f.write(f"书名：《{name}》\n作者：{author_name}\n\n简介：\n{description}\n\n")
                       for index in sorted(content_cache.keys()):
                           chapter, content = content_cache[index]
 
@@ -317,7 +443,6 @@ jobs:
                           f.write(f"\n{chapter['title']}\n\n")
                           f.write(content + "\n\n")
 
-                  print(f"\n下载完成！成功：{success_count}章，失败：{total_chapters - success_count}章")
                   print(f"文件保存在：{output_file}")
 
                   # 不再生成EPUB
@@ -327,7 +452,7 @@ jobs:
 
               except Exception as e:
                   print(f"\n错误：{str(e)}")
-                  print(f"下载失败: {str(e)}")
+                  print(f"::error::下载失败: {str(e)}")
                   return False
 
           # 执行下载
@@ -367,6 +492,7 @@ jobs:
           # 更新 Artifact 名称以反映仅 TXT
           name: novel-${{ github.event.inputs.novel_id }}-txt
           path: novel_files.zip
+          if-no-files-found: error  # 没有产物时让步骤失败，而不是静默通过
           retention-days: 7  # 文件保存7天
 
       - name: 提供下载信息
