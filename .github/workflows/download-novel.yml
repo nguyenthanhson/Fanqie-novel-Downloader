@@ -10,6 +10,14 @@ on:
         description: '下载线程数 (1-10)'
         required: true
         default: '5'
+      start_chapter:
+        description: '起始章节序号 (从1开始，默认1即从头下载)'
+        required: false
+        default: '1'
+      end_chapter:
+        description: '结束章节序号 (含该章，0表示下载到最后一章)'
+        required: false
+        default: '0'
 
 # 添加必要的权限
 permissions:
@@ -68,6 +76,12 @@ jobs:
           novel_id = sys.argv[1]
           # output_format = sys.argv[2].lower() # 格式固定为 txt
           threads_count = int(sys.argv[2]) # 参数索引调整
+          # 章节范围(从1开始，含两端)；空值按默认处理
+          start_chapter = int(sys.argv[3] or 1)
+          end_chapter = int(sys.argv[4] or 0)  # 0 表示到最后一章
+          if start_chapter < 1 or end_chapter < 0 or (end_chapter and end_chapter < start_chapter):
+              print(f"::error::章节范围无效: 起始={start_chapter}, 结束={end_chapter}")
+              sys.exit(1)
           save_path = "novel_output"
 
           # EPUB生成函数 (已移除)
@@ -378,6 +392,14 @@ jobs:
                   if not chapters:
                       raise Exception("未找到任何章节")
 
+                  # 按范围截取章节；章节序号沿用全书序号，标题和 index 不变
+                  all_count = len(chapters)
+                  if start_chapter > all_count:
+                      raise Exception(f"起始章节 {start_chapter} 超出全书章节数 {all_count}")
+                  last_chapter = min(end_chapter, all_count) if end_chapter else all_count
+                  chapters = chapters[start_chapter - 1:last_chapter]
+                  print(f"全书共 {all_count} 章，本次下载第 {start_chapter}-{last_chapter} 章")
+
                   # 先探测内容接口：全部不可用时几秒内就失败，而不是逐章重试几十分钟
                   print(f"\n共 {len(chapters)} 章，正在探测内容接口...")
                   usable_sources = probe_sources(chapters)
@@ -473,7 +495,8 @@ jobs:
 
                   # 按顺序写入文件
                   print("\n正在保存文件...")
-                  output_file = os.path.join(save_path, f"{name}.txt")
+                  range_suffix = "" if (start_chapter == 1 and last_chapter == all_count) else f"_第{start_chapter}-{last_chapter}章"
+                  output_file = os.path.join(save_path, f"{name}{range_suffix}.txt")
 
                   # 检查重复章节内容
                   processed_contents = set()
@@ -526,11 +549,16 @@ jobs:
           EOF
 
       - name: 下载小说
+        env:
+          NOVEL_ID: ${{ github.event.inputs.novel_id }}
+          THREADS: ${{ github.event.inputs.threads }}
+          START_CHAPTER: ${{ github.event.inputs.start_chapter }}
+          END_CHAPTER: ${{ github.event.inputs.end_chapter }}
         run: |
           echo "开始下载小说 (TXT格式)..."
           # 不再传递 format 参数
           # -u: 不缓冲输出，Actions 日志才能实时显示下载进度
-          python -u download_novel.py "${{ github.event.inputs.novel_id }}" "${{ github.event.inputs.threads }}"
+          python -u download_novel.py "$NOVEL_ID" "$THREADS" "$START_CHAPTER" "$END_CHAPTER"
 
       - name: 压缩下载结果
         run: |
